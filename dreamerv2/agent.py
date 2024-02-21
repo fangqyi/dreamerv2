@@ -7,13 +7,16 @@ import expl
 
 class Agent(common.Module):
 
-  def __init__(self, config, obs_space, act_space, step):
+  def __init__(self, config, obs_space, act_space, step, pretrained_wm=None):
     self.config = config
     self.obs_space = obs_space
     self.act_space = act_space['action']
     self.step = step
     self.tfstep = tf.Variable(int(self.step), tf.int64)
-    self.wm = WorldModel(config, obs_space, self.tfstep)
+    if pretrained_wm is None:
+      self.wm = WorldModel(config, obs_space, self.tfstep)
+    else:
+      self.wm = pretrained_wm
     self._task_behavior = ActorCritic(config, self.act_space, self.tfstep)
     if config.expl_behavior == 'greedy':
       self._expl_behavior = self._task_behavior
@@ -55,6 +58,68 @@ class Agent(common.Module):
     return outputs, state
 
   @tf.function
+  def train(self, data, state=None, wm_train_skip=False):
+    metrics = {}
+    if wm_train_skip:
+      outputs = self.wm.infer(data, state)
+    else:
+      state, outputs, mets = self.wm.train(data, state)
+      metrics.update(mets)
+    start = outputs['post']
+    reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
+    metrics.update(self._task_behavior.train(
+        self.wm, start, data['is_terminal'], reward))
+    if self.config.expl_behavior != 'greedy':  # wm_train_skip might break if not "greedy" if outputs doesn't have needed info
+      mets = self._expl_behavior.train(start, outputs, data)[-1]
+      metrics.update({'expl_' + key: value for key, value in mets.items()})
+    return state, metrics
+
+  @tf.function
+  def report(self, data):
+    report = {}
+    data = self.wm.preprocess(data)
+    for key in self.wm.heads['decoder'].cnn_keys:
+      name = key.replace('/', '_')
+      report[f'openl_{name}'] = self.wm.video_pred(data, key)
+    return report
+
+
+class DummyAgentWM(common.Module):
+
+  def __init__(self, config, obs_space, act_space, step):
+    self.config = config
+    self.obs_space = obs_space
+    self.act_space = act_space['action']
+    self.step = step
+    self.random_agent = common.RandomAgent(act_space)
+    self.tfstep = tf.Variable(int(self.step), tf.int64)
+    self.wm = WorldModel(config, obs_space, self.tfstep)
+    self._task_behavior = ActorCritic(config, self.act_space, self.tfstep)
+    self._expl_behavior = None
+
+  def get_wm(self):
+    return self.wm
+
+  @tf.function
+  def policy(self, obs, state=None):
+    obs = tf.nest.map_structure(tf.tensor, obs)
+    tf.py_function(lambda: self.tfstep.assign(
+        int(self.step), read_value=False), [], [])
+    if state is None:
+      latent = self.wm.rssm.initial(len(obs['reward']))
+      action = tf.zeros((len(obs['reward']),) + self.act_space.shape)
+      state = latent, action
+    latent, action = state
+    embed = self.wm.encoder(self.wm.preprocess(obs))
+    sample = self.config.eval_state_mean
+    latent, _ = self.wm.rssm.obs_step(
+        latent, action, embed, obs['is_first'], sample)
+    # feat = self.wm.rssm.get_feat(latent)
+    outputs = self.random_agent(obs)
+    state = (latent, action)
+    return outputs, state
+
+  @tf.function
   def train(self, data, state=None):
     metrics = {}
     state, outputs, mets = self.wm.train(data, state)
@@ -63,9 +128,6 @@ class Agent(common.Module):
     reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
     metrics.update(self._task_behavior.train(
         self.wm, start, data['is_terminal'], reward))
-    if self.config.expl_behavior != 'greedy':
-      mets = self._expl_behavior.train(start, outputs, data)[-1]
-      metrics.update({'expl_' + key: value for key, value in mets.items()})
     return state, metrics
 
   @tf.function
@@ -101,6 +163,13 @@ class WorldModel(common.Module):
     modules = [self.encoder, self.rssm, *self.heads.values()]
     metrics.update(self.model_opt(model_tape, model_loss, modules))
     return state, outputs, metrics
+
+  def infer(self, data, state=None):
+    data = self.preprocess(data)
+    embed = self.encoder(data)
+    post, prior = self.rssm.observe(
+      embed, data['action'], data['is_first'], state)
+    return dict(embed=embed, post=post, prior=prior)
 
   def loss(self, data, state=None):
     data = self.preprocess(data)
