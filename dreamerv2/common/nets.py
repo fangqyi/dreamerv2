@@ -4,7 +4,8 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers as tfkl
 from tensorflow_probability import distributions as tfd
-from tensorflow.keras.mixed_precision import experimental as prec
+# from tensorflow.keras.mixed_precision import experimental as prec
+import tensorflow.keras.mixed_precision as prec
 
 import common
 
@@ -13,7 +14,7 @@ class EnsembleRSSM(common.Module):
 
   def __init__(
       self, ensemble=5, stoch=30, deter=200, hidden=200, discrete=False,
-      act='elu', norm='none', std_act='softplus', min_std=0.1):
+      act='elu', norm='none', std_act='softplus', min_std=0.1, use_jacreg=False, num_proj = 1):
     super().__init__()
     self._ensemble = ensemble
     self._stoch = stoch
@@ -26,6 +27,8 @@ class EnsembleRSSM(common.Module):
     self._min_std = min_std
     self._cell = GRUCell(self._deter, norm=True)
     self._cast = lambda x: tf.cast(x, prec.global_policy().compute_dtype)
+    self._use_jacreg = use_jacreg
+    self._num_proj = num_proj
 
   def initial(self, batch_size):
     dtype = prec.global_policy().compute_dtype
@@ -47,11 +50,19 @@ class EnsembleRSSM(common.Module):
     swap = lambda x: tf.transpose(x, [1, 0] + list(range(2, len(x.shape))))
     if state is None:
       state = self.initial(tf.shape(action)[0])
-    post, prior = common.static_scan(
-        lambda prev, inputs: self.obs_step(prev[0], *inputs),
-        (swap(action), swap(embed), swap(is_first)), (state, state))
+    if self._use_jacreg:
+      post, prior, jac_reg = common.static_scan(
+          lambda prev, inputs: self.obs_step(prev[0], *inputs),
+          (swap(action), swap(embed), swap(is_first)), (state, state, tf.constant(0, tf.float16)))
+    else:
+      post, prior = common.static_scan(
+          lambda prev, inputs: self.obs_step(prev[0], *inputs),
+          (swap(action), swap(embed), swap(is_first)), (state, state))
+
     post = {k: swap(v) for k, v in post.items()}
     prior = {k: swap(v) for k, v in prior.items()}
+    if self._use_jacreg:
+      prior['jac_reg'] = jac_reg
     return post, prior
 
   @tf.function
@@ -61,8 +72,19 @@ class EnsembleRSSM(common.Module):
       state = self.initial(tf.shape(action)[0])
     assert isinstance(state, dict), state
     action = swap(action)
-    prior = common.static_scan(self.img_step, action, state)
+    # print("in imagine,", state)
+    results = common.static_scan(self.img_step, action, state)
+    # print("in imagine results,", results)
+    if len(results) == 2:
+      prior, jac_reg = results
+    else:
+      prior = results
+
+    # prior = common.static_scan(self.img_step, action, state)
+
     prior = {k: swap(v) for k, v in prior.items()}
+    if len(results) == 2:#self._use_jacreg: shotgun
+      prior['jac_reg'] = jac_reg
     return prior
 
   def get_feat(self, state):
@@ -93,7 +115,10 @@ class EnsembleRSSM(common.Module):
         lambda x: tf.einsum(
             'b,b...->b...', 1.0 - is_first.astype(x.dtype), x),
         (prev_state, prev_action))
-    prior = self.img_step(prev_state, prev_action, sample)
+    if self._use_jacreg:
+      prior, jac_reg = self.img_step(prev_state, prev_action, sample=sample)
+    else:
+      prior = self.img_step(prev_state, prev_action, sample=sample)
     x = tf.concat([prior['deter'], embed], -1)
     x = self.get('obs_out', tfkl.Dense, self._hidden)(x)
     x = self.get('obs_out_norm', NormLayer, self._norm)(x)
@@ -102,10 +127,16 @@ class EnsembleRSSM(common.Module):
     dist = self.get_dist(stats)
     stoch = dist.sample() if sample else dist.mode()
     post = {'stoch': stoch, 'deter': prior['deter'], **stats}
-    return post, prior
-
+    if self._use_jacreg:
+      return post, prior, jac_reg
+    else:
+      return post, prior
+  
   @tf.function
   def img_step(self, prev_state, prev_action, sample=True):
+    # print("img_step, ", prev_state)
+    if type(prev_state) == type(()): # hardcode , too tired to debug properly
+      prev_state = prev_state[0] 
     prev_stoch = self._cast(prev_state['stoch'])
     prev_action = self._cast(prev_action)
     if self._discrete:
@@ -116,15 +147,59 @@ class EnsembleRSSM(common.Module):
     x = self.get('img_in_norm', NormLayer, self._norm)(x)
     x = self._act(x)
     deter = prev_state['deter']
-    x, deter = self._cell(x, [deter])
-    deter = deter[0]  # Keras wraps the state in a list.
-    stats = self._suff_stats_ensemble(x)
+    
+    if self._use_jacreg == False:
+      x_after, deter_after = self._cell(x, [deter])
+      deter_after = deter_after[0]  # Keras wraps the state in a list.
+    else:
+      jacregs = []
+      def _random_vector(C, B):
+      # creates a random vector of dimension C with a norm of C^(1/2)
+        if C == 1:
+          return tf.ones((B,), dtype=tf.float16)
+        v = tf.random.uniform((B, C), dtype=tf.float16)
+        vnorm = tf.linalg.norm(v, axis=1, keepdims=True)
+        return tf.math.divide(v, vnorm)
+      
+      # with tf.GradientTape(persistent=True) as tape:
+      #   tape.watch(deter) # in case the initial is constant??
+      #   x_after, deter_after = self._cell(x, [deter])
+      #   deter_after = deter_after[0]  # Keras wraps the state in a list.
+      #   B, C = deter_after.shape
+      #   flat_deter_after = tf.reshape(deter_after, (-1,))
+      B, C = deter.shape
+      if self._num_proj == -1:
+        v = tf.zeros((B, C))
+        v[:, idx] = 1.
+      else:
+        v = _random_vector(C=C, B=B)
+      # flat_v = tf.reshape(v, (-1,))
+      with tf.autodiff.ForwardAccumulator(primals=deter, tangents=v) as acc:
+        x_after, deter_after = self._cell(x, [deter])
+        deter_after = deter_after[0]
+        flat_deter_after = tf.reshape(deter_after, (-1,))
+        
+      if self._num_proj == -1:
+        num_proj = C
+      else:
+        num_proj = self._num_proj
+      for idx in range(num_proj):
+        Jv = acc.jvp(flat_deter_after)
+        # jacregs.append( tf.math.pow(tf.linalg.norm(Jv), 2) ) # 0.5 * C *#/ tf.constant(num_proj*B, dtype=tf.float16)
+        jacregs.append(tf.constant(0.5 * C, dtype=tf.float16) * (tf.sqrt(tf.reduce_sum(tf.square(Jv)))+ 1.0e-12) / tf.constant(num_proj*B, dtype=tf.float16))
+      jacreg = tf.add_n(jacregs)
+
+    stats = self._suff_stats_ensemble(x_after)
     index = tf.random.uniform((), 0, self._ensemble, tf.int32)
     stats = {k: v[index] for k, v in stats.items()}
     dist = self.get_dist(stats)
     stoch = dist.sample() if sample else dist.mode()
-    prior = {'stoch': stoch, 'deter': deter, **stats}
-    return prior
+    prior = {'stoch': stoch, 'deter': deter_after, **stats}
+    
+    if self._use_jacreg:
+      return prior, jacreg
+    else:
+      return prior
 
   def _suff_stats_ensemble(self, inp):
     bs = list(inp.shape[:-1])

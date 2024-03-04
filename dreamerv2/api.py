@@ -218,7 +218,7 @@ def open_train(env, config, outputs=None):
   while step < config.steps:
     logger.write()
     driver(dummy_policy, steps=config.eval_every)
-    dummy_agent.save(logdir / 'wm_variables.pkl')
+    dummy_agent.save(logdir / 'wm_variables_2.pkl')
 
   print('Create agent.')
   agnt = agent.Agent(config, env.obs_space, env.act_space, step)

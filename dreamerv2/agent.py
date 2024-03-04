@@ -9,6 +9,7 @@ class Agent(common.Module):
 
   def __init__(self, config, obs_space, act_space, step, pretrained_wm=None):
     self.config = config
+    self.use_jacreg = config.rssm["use_jacreg"]
     self.obs_space = obs_space
     self.act_space = act_space['action']
     self.step = step
@@ -37,8 +38,13 @@ class Agent(common.Module):
     latent, action = state
     embed = self.wm.encoder(self.wm.preprocess(obs))
     sample = (mode == 'train') or not self.config.eval_state_mean
-    latent, _ = self.wm.rssm.obs_step(
+    # print("MIGHT CRASH")
+    latent = self.wm.rssm.obs_step(
         latent, action, embed, obs['is_first'], sample)
+    if self.use_jacreg:
+      latent, _, _ = latent
+    else:
+      latent, _ = latent
     feat = self.wm.rssm.get_feat(latent)
     if mode == 'eval':
       actor = self._task_behavior.actor(feat)
@@ -77,6 +83,7 @@ class Agent(common.Module):
   @tf.function
   def report(self, data):
     report = {}
+    print(data)
     data = self.wm.preprocess(data)
     for key in self.wm.heads['decoder'].cnn_keys:
       name = key.replace('/', '_')
@@ -115,7 +122,8 @@ class DummyAgentWM(common.Module):
     latent, _ = self.wm.rssm.obs_step(
         latent, action, embed, obs['is_first'], sample)
     # feat = self.wm.rssm.get_feat(latent)
-    outputs = self.random_agent(obs)
+    outputs, _ = self.random_agent(obs)
+    # print("actions", outputs)
     state = (latent, action)
     return outputs, state
 
@@ -124,10 +132,10 @@ class DummyAgentWM(common.Module):
     metrics = {}
     state, outputs, mets = self.wm.train(data, state)
     metrics.update(mets)
-    start = outputs['post']
-    reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
-    metrics.update(self._task_behavior.train(
-        self.wm, start, data['is_terminal'], reward))
+    # start = outputs['post']
+    # reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
+    # metrics.update(self._task_behavior.train(
+    #     self.wm, start, data['is_terminal'], reward))
     return state, metrics
 
   @tf.function
@@ -146,6 +154,8 @@ class WorldModel(common.Module):
     shapes = {k: tuple(v.shape) for k, v in obs_space.items()}
     self.config = config
     self.tfstep = tfstep
+    self.use_jacreg = config.rssm["use_jacreg"]
+    # print("Jacobian regularization used in WM loss")
     self.rssm = common.EnsembleRSSM(**config.rssm)
     self.encoder = common.Encoder(shapes, **config.encoder)
     self.heads = {}
@@ -180,6 +190,11 @@ class WorldModel(common.Module):
     assert len(kl_loss.shape) == 0
     likes = {}
     losses = {'kl': kl_loss}
+    
+    if self.use_jacreg:
+      jac_loss = tf.cast(tf.reduce_mean(prior["jac_reg"]) * self.config.jac_lambda, tf.float32)
+      losses = {'kl': kl_loss, 'jac_loss': jac_loss}
+    
     feat = self.rssm.get_feat(post)
     for name, head in self.heads.items():
       grad_head = (name in self.config.grad_heads)
@@ -190,6 +205,7 @@ class WorldModel(common.Module):
         like = tf.cast(dist.log_prob(data[key]), tf.float32)
         likes[key] = like
         losses[key] = -like.mean()
+    # print(losses.items())
     model_loss = sum(
         self.config.loss_scales.get(k, 1.0) * v for k, v in losses.items())
     outs = dict(
@@ -211,6 +227,8 @@ class WorldModel(common.Module):
     for _ in range(horizon):
       action = policy(tf.stop_gradient(seq['feat'][-1])).sample()
       state = self.rssm.img_step({k: v[-1] for k, v in seq.items()}, action)
+      if self.use_jacreg:
+        state, _ = state # ignore jac_reg return
       feat = self.rssm.get_feat(state)
       for key, value in {**state, 'action': action, 'feat': feat}.items():
         seq[key].append(value)
@@ -262,7 +280,11 @@ class WorldModel(common.Module):
         embed[:6, :5], data['action'][:6, :5], data['is_first'][:6, :5])
     recon = decoder(self.rssm.get_feat(states))[key].mode()[:6]
     init = {k: v[:, -1] for k, v in states.items()}
+    
     prior = self.rssm.imagine(data['action'][:6, 5:], init)
+    # if self.use_jacreg:
+    #   prior, _ = prior
+
     openl = decoder(self.rssm.get_feat(prior))[key].mode()
     model = tf.concat([recon[:, :5] + 0.5, openl + 0.5], 1)
     error = (model - truth + 1) / 2

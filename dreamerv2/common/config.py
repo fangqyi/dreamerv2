@@ -30,7 +30,8 @@ class Config(dict):
     elif filename.suffix in ('.yml', '.yaml'):
       import ruamel.yaml as yaml
       with filename.open('w') as f:
-        yaml.safe_dump(dict(self), f)
+        yaml_loader = yaml.YAML(typ='safe', pure=True)
+        yaml_loader.dump(dict(self), f)
     else:
       raise NotImplementedError(filename.suffix)
 

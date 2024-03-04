@@ -62,6 +62,7 @@ class Replay:
     self._enforce_limit()
 
   def dataset(self, batch, length):
+    print("length", length)
     example = next(iter(self._generate_chunks(length)))
     dataset = tf.data.Dataset.from_generator(
         lambda: self._generate_chunks(length),
